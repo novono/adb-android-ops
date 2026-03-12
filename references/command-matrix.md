@@ -9,11 +9,14 @@ python3 scripts/adb_ops.py [--serial SERIAL|auto] [--format text|json] [--out-di
 - `--serial auto`: resolve the only online device; fail if zero or more than one device is attached
 - `--format text|json`: choose operator output mode
 - `--out-dir DIR`: default is `output/adb-android-ops/<timestamp>/`
+- `adb` resolution: prefer `adb` from `PATH`; if missing, fall back to the bundled binary under `assets/platform-tools/<os>/platform-tools/`
 
 ## device
 - `device list`
 - `device info`
 - `device wait [--timeout SECONDS]`
+- `device core-info`
+- `device storage`
 
 ## props
 - `props get <key>`
@@ -36,6 +39,7 @@ python3 scripts/adb_ops.py [--serial SERIAL|auto] [--format text|json] [--out-di
 - `app start-time <package> [--activity ACTIVITY] [--warm]`
 - `app stop <package>`
 - `app resources <package>`
+- `app video-codec [--package PACKAGE] [--limit N]`
 
 ## ui
 - `ui capture`
@@ -64,5 +68,7 @@ Notes:
 - `system root`
 - `system unroot`
 - `system remount`
+- `system build-prop-get <key> [--path PATH]`
+- `system build-prop-set <key=value> [<key=value> ...] [--path PATH] [--reboot]`
 - `system reboot [--mode system|bootloader|recovery]`
 - `system boot-status`

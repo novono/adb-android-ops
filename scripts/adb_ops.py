@@ -15,10 +15,46 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from PIL import Image, ImageChops
+try:
+    from PIL import Image, ImageChops
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+    ImageChops = None
 
 
-ADB = shutil.which("adb") or "adb"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent
+
+
+def bundled_adb_path() -> Path | None:
+    if sys.platform.startswith("darwin"):
+        candidate = SKILL_ROOT / "assets" / "platform-tools" / "darwin" / "platform-tools" / "adb"
+    elif sys.platform.startswith("linux"):
+        candidate = SKILL_ROOT / "assets" / "platform-tools" / "linux" / "platform-tools" / "adb"
+    elif sys.platform.startswith("win"):
+        candidate = SKILL_ROOT / "assets" / "platform-tools" / "windows" / "platform-tools" / "adb.exe"
+    else:
+        return None
+    if candidate.exists():
+        if not sys.platform.startswith("win"):
+            candidate.chmod(candidate.stat().st_mode | 0o111)
+        return candidate
+    return None
+
+
+def resolve_adb_binary() -> tuple[str, str]:
+    path_adb = shutil.which("adb")
+    if path_adb:
+        return path_adb, "path"
+    bundled = bundled_adb_path()
+    if bundled:
+        return str(bundled), "bundled"
+    raise RuntimeError(
+        "adb was not found on PATH and no bundled platform-tools adb binary was found for this OS."
+    )
+
+
+ADB, ADB_SOURCE = resolve_adb_binary()
 
 
 class AdbOpsError(RuntimeError):
@@ -236,9 +272,60 @@ def shell_out(serial: str, command: str, result: ActionResult | None = None, *, 
     return stdout
 
 
+def shell_out_su(serial: str, script: str, result: ActionResult | None = None, *, check: bool = True) -> str:
+    argv = adb_command(serial, "shell", f"su 0 sh -c {shlex_quote(script)}")
+    if result:
+        stdout, _ = record_run(result, argv, check=check)
+    else:
+        stdout = run_command(argv, check=check, text=True).stdout
+    return stdout
+
+
 def maybe_shell(serial: str, command: str) -> str:
     proc = run_command(adb_command(serial, "shell", command), check=False, text=True)
     return proc.stdout
+
+
+def parse_simple_kv_blob(blob: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    pattern = re.compile(r"([A-Za-z0-9_.-]+):(.+?)(?=\s+[A-Za-z0-9_.-]+:|$)")
+    for match in pattern.finditer(blob.strip()):
+        pairs[match.group(1)] = match.group(2).strip()
+    return pairs
+
+
+def bytes_to_human(size_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return f"{size_bytes}B"
+
+
+def get_foreground_activity(serial: str, result: ActionResult | None = None) -> dict[str, str]:
+    output = shell_out(
+        serial,
+        "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        result,
+        check=False,
+    ) if result else maybe_shell(serial, "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true")
+    if not output.strip():
+        fallback = shell_out(
+            serial,
+            "dumpsys activity top | grep -m 1 'ACTIVITY ' || true",
+            result,
+            check=False,
+        ) if result else maybe_shell(serial, "dumpsys activity top | grep -m 1 'ACTIVITY ' || true")
+        output = fallback
+    activity = ""
+    package = ""
+    match = re.search(r"([A-Za-z0-9_.]+)/([A-Za-z0-9_.$/]+)", output)
+    if match:
+        package = match.group(1)
+        activity = f"{match.group(1)}/{match.group(2)}"
+    return {"package": package, "activity": activity, "raw": output.strip()}
 
 
 def wait_for_boot(serial: str, result: ActionResult, timeout: int = 180) -> None:
@@ -259,6 +346,71 @@ def dumpsys_bluetooth(serial: str, result: ActionResult | None = None) -> str:
     else:
         stdout = run_command(argv, check=True, text=True).stdout
     return stdout
+
+
+def perform_root(serial: str, result: ActionResult) -> str:
+    stdout, _ = record_run(result, adb_command(serial, "root"), check=False)
+    record_run(result, adb_command(serial, "wait-for-device"))
+    return stdout.strip()
+
+
+def run_remount_strategy(serial: str, result: ActionResult) -> dict[str, Any]:
+    strategies: list[tuple[str, list[str] | str]] = [
+        ("direct-remount", adb_command(serial, "remount")),
+        ("root-then-remount", adb_command(serial, "root")),
+        ("su-mount", "mount -o rw,remount /system || mount -o rw,remount /"),
+    ]
+    chosen = None
+    failures: list[dict[str, Any]] = []
+    for name, command in strategies:
+        try:
+            if isinstance(command, list):
+                record_run(result, command, check=False)
+                if name == "root-then-remount":
+                    record_run(result, adb_command(serial, "wait-for-device"))
+                    stdout, _ = record_run(result, adb_command(serial, "remount"), check=False)
+                else:
+                    stdout = result.commands[-1].stdout
+            else:
+                stdout = shell_out_su(serial, command, result, check=False)
+            normalized = stdout.lower()
+            if "remount succeeded" in normalized or "rw" in normalized or "already running as root" in normalized:
+                chosen = name
+                break
+            if name == "su-mount":
+                chosen = name
+                break
+            failures.append({"strategy": name, "stdout": stdout.strip()})
+        except Exception as exc:  # pragma: no cover - device-dependent failures
+            failures.append({"strategy": name, "error": str(exc)})
+    if not chosen:
+        raise AdbOpsError("All remount strategies failed.")
+    return {"strategy": chosen, "failures": failures, "strategy_count": len(strategies)}
+
+
+def resolve_build_prop_path(serial: str, result: ActionResult, requested: str | None = None) -> str:
+    if requested:
+        exists = shell_out(serial, f"if [ -f {shlex_quote(requested)} ]; then echo FOUND; fi", result, check=False).strip()
+        if exists == "FOUND":
+            return requested
+        raise AdbOpsError(f"Requested build.prop path does not exist: {requested}")
+    candidates = ["/system/build.prop", "/system/system/build.prop", "/product/build.prop", "/vendor/build.prop"]
+    for path in candidates:
+        exists = shell_out(serial, f"if [ -f {shlex_quote(path)} ]; then echo FOUND; fi", result, check=False).strip()
+        if exists == "FOUND":
+            return path
+    raise AdbOpsError("Unable to locate a readable build.prop path on the device.")
+
+
+def parse_build_prop(content: str) -> dict[str, str]:
+    props: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        props[key.strip()] = value.strip()
+    return props
 
 
 def capture_ui(serial: str, result: ActionResult) -> dict[str, str]:
@@ -303,6 +455,13 @@ def ensure_playwright() -> Any:
     return sync_playwright
 
 
+def ensure_pillow() -> None:
+    if Image is None or ImageChops is None:
+        raise AdbOpsError(
+            "UI image processing requires Pillow. Install it with `python3 -m pip install --user Pillow`."
+        )
+
+
 def design_source_kind(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"}:
@@ -316,6 +475,7 @@ def design_source_kind(value: str) -> str:
 
 
 def render_design_to_png(design: str, output_path: Path, width: int, height: int) -> None:
+    ensure_pillow()
     kind = design_source_kind(design)
     if kind == "image":
         with Image.open(design) as image:
@@ -334,6 +494,7 @@ def render_design_to_png(design: str, output_path: Path, width: int, height: int
 
 
 def compute_image_metrics(design_path: Path, device_path: Path, diff_path: Path) -> dict[str, Any]:
+    ensure_pillow()
     with Image.open(design_path) as design_img, Image.open(device_path) as device_img:
         design = design_img.convert("RGBA")
         device = device_img.convert("RGBA")
@@ -419,6 +580,124 @@ def action_device_wait(args: argparse.Namespace, result: ActionResult) -> None:
     record_run(result, adb_command(result.serial, "wait-for-device"), timeout=timeout)
     result.summary = {"state": "device"}
     result.metrics = {"timeout_seconds": timeout}
+
+
+def action_device_core_info(args: argparse.Namespace, result: ActionResult) -> None:
+    serial = result.serial
+    batch_keys = [
+        "ro.product.brand",
+        "ro.product.manufacturer",
+        "ro.product.model",
+        "ro.product.device",
+        "ro.product.board",
+        "ro.hardware",
+        "ro.product.cpu.abilist",
+        "ro.build.fingerprint",
+        "ro.build.version.release",
+        "ro.build.version.sdk",
+        "ro.build.version.security_patch",
+        "ro.build.type",
+        "ro.build.tags",
+        "ro.boot.verifiedbootstate",
+        "ro.debuggable",
+        "ro.secure",
+        "sys.boot_completed",
+    ]
+    props = {key: get_prop(serial, key, result) for key in batch_keys}
+    meminfo = shell_out(serial, "cat /proc/meminfo | head -n 10", result)
+    cpuinfo = shell_out(serial, "cat /proc/cpuinfo | head -n 40", result)
+    display_size = shell_out(serial, "wm size", result).strip()
+    display_density = shell_out(serial, "wm density", result).strip()
+    uptime = shell_out(serial, "uptime", result).strip()
+    foreground = get_foreground_activity(serial, result)
+    result.save_text_file("meminfo.txt", meminfo)
+    result.save_text_file("cpuinfo.txt", cpuinfo)
+    result.summary = {
+        "identity": {
+            "brand": props["ro.product.brand"],
+            "manufacturer": props["ro.product.manufacturer"],
+            "model": props["ro.product.model"],
+            "device": props["ro.product.device"],
+            "board": props["ro.product.board"],
+            "hardware": props["ro.hardware"],
+        },
+        "android": {
+            "release": props["ro.build.version.release"],
+            "sdk": props["ro.build.version.sdk"],
+            "security_patch": props["ro.build.version.security_patch"],
+            "fingerprint": props["ro.build.fingerprint"],
+            "build_type": props["ro.build.type"],
+            "build_tags": props["ro.build.tags"],
+        },
+        "runtime": {
+            "abi_list": props["ro.product.cpu.abilist"],
+            "verified_boot_state": props["ro.boot.verifiedbootstate"],
+            "debuggable": props["ro.debuggable"],
+            "secure": props["ro.secure"],
+            "boot_completed": props["sys.boot_completed"],
+            "uptime": uptime,
+            "display_size": display_size,
+            "display_density": display_density,
+            "foreground": foreground,
+        },
+    }
+    mem_total = re.search(r"MemTotal:\s+(\d+)\s+kB", meminfo)
+    result.metrics = {
+        "mem_total_kb": int(mem_total.group(1)) if mem_total else 0,
+        "cpuinfo_lines": len(cpuinfo.splitlines()),
+    }
+
+
+def action_device_storage(args: argparse.Namespace, result: ActionResult) -> None:
+    partitions_raw = shell_out(result.serial, "cat /proc/partitions", result)
+    df_raw = shell_out(result.serial, "df -h", result)
+    mount_raw = shell_out(result.serial, "mount", result)
+    by_name_raw = shell_out(result.serial, "ls -l /dev/block/by-name || true", result, check=False)
+    result.save_text_file("proc-partitions.txt", partitions_raw)
+    result.save_text_file("df.txt", df_raw)
+    result.save_text_file("mount.txt", mount_raw)
+    result.save_text_file("by-name.txt", by_name_raw)
+
+    partitions: list[dict[str, Any]] = []
+    for line in partitions_raw.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        blocks = int(parts[2])
+        partitions.append(
+            {
+                "name": parts[3],
+                "blocks_kb": blocks,
+                "size_human": bytes_to_human(blocks * 1024),
+            }
+        )
+    partitions.sort(key=lambda item: item["blocks_kb"], reverse=True)
+
+    filesystems: list[dict[str, str]] = []
+    for line in df_raw.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        filesystems.append(
+            {
+                "filesystem": parts[0],
+                "size": parts[1],
+                "used": parts[2],
+                "avail": parts[3],
+                "use_percent": parts[4],
+                "mounted_on": parts[5],
+            }
+        )
+    result.summary = {
+        "top_partitions": partitions[:15],
+        "filesystems": filesystems[:20],
+    }
+    data_fs = next((fs for fs in filesystems if fs["mounted_on"] == "/data"), None)
+    result.metrics = {
+        "partition_count": len(partitions),
+        "filesystem_count": len(filesystems),
+        "data_use_percent": data_fs["use_percent"] if data_fs else "",
+    }
 
 
 def action_props_get(args: argparse.Namespace, result: ActionResult) -> None:
@@ -574,7 +853,12 @@ def action_app_resources(args: argparse.Namespace, result: ActionResult) -> None
     if pid:
         su_exists = bool(maybe_shell(result.serial, "which su").strip())
         if su_exists:
-            proc_snapshot = shell_out(result.serial, f"su -c 'cat /proc/{pid}/status /proc/{pid}/stat /proc/{pid}/limits'", result, check=False)
+            proc_snapshot = shell_out_su(
+                result.serial,
+                f"cat /proc/{pid}/status /proc/{pid}/stat /proc/{pid}/limits",
+                result,
+                check=False,
+            )
             result.save_text_file("proc-status.txt", proc_snapshot)
             result.metrics["root_proc_snapshot"] = True
     meminfo = (result.artifact_dir / "meminfo.txt").read_text(encoding="utf-8")
@@ -584,6 +868,55 @@ def action_app_resources(args: argparse.Namespace, result: ActionResult) -> None
         result.metrics["total_pss_kb"] = int(pss_match.group(1).replace(",", ""))
 
 
+def action_app_video_codec(args: argparse.Namespace, result: ActionResult) -> None:
+    metrics_dump = shell_out(result.serial, "dumpsys media.metrics", result, check=False)
+    player_dump = shell_out(result.serial, "dumpsys media.player", result, check=False)
+    session_dump = shell_out(result.serial, "dumpsys media_session", result, check=False)
+    foreground = get_foreground_activity(result.serial, result)
+    result.save_text_file("media-metrics.txt", metrics_dump)
+    result.save_text_file("media-player.txt", player_dump)
+    result.save_text_file("media-session.txt", session_dump)
+
+    codec_entries: list[dict[str, Any]] = []
+    for line in metrics_dump.splitlines():
+        if "mediametrics_codec_reported" not in line or "mime:video/" not in line:
+            continue
+        payload = parse_simple_kv_blob(line[line.find("{") + 1 : line.rfind("}")])
+        package_name = payload.get("package_name", "")
+        if args.package and args.package not in package_name:
+            continue
+        codec_entries.append(
+            {
+                "timestamp_nanos": payload.get("timestamp_nanos", ""),
+                "package_name": package_name,
+                "app_uid": payload.get("app_uid", ""),
+                "codec": payload.get("codec", ""),
+                "mime": payload.get("mime", ""),
+                "encoder": payload.get("encoder", ""),
+                "width": payload.get("width", ""),
+                "height": payload.get("height", ""),
+                "frame_rate": payload.get("frame_rate", ""),
+                "bitrate": payload.get("bitrate", ""),
+                "lifetime_millis": payload.get("lifetime_millis", ""),
+            }
+        )
+    codec_entries.reverse()
+    limited_entries = codec_entries[: args.limit]
+    active_packages_match = re.search(r"Audio playback .*?packages=([^\n]+)", session_dump, re.DOTALL)
+    active_packages = active_packages_match.group(1).split() if active_packages_match else []
+    result.summary = {
+        "foreground": foreground,
+        "filtered_package": args.package or "",
+        "active_packages": active_packages,
+        "video_codec_entries": limited_entries,
+    }
+    result.metrics = {
+        "entry_count": len(codec_entries),
+        "returned_count": len(limited_entries),
+        "has_video_activity": bool(codec_entries),
+    }
+
+
 def action_ui_capture(args: argparse.Namespace, result: ActionResult) -> None:
     artifacts = capture_ui(result.serial, result)
     result.summary = {"captured": True}
@@ -591,6 +924,7 @@ def action_ui_capture(args: argparse.Namespace, result: ActionResult) -> None:
 
 
 def action_ui_compare(args: argparse.Namespace, result: ActionResult) -> None:
+    ensure_pillow()
     capture_ui(result.serial, result)
     device_path = result.artifact_dir / "device.png"
     design_path = result.artifact_dir / "design.png"
@@ -733,9 +1067,8 @@ def action_radio_bluetooth(args: argparse.Namespace, result: ActionResult) -> No
 
 
 def action_system_root(args: argparse.Namespace, result: ActionResult) -> None:
-    stdout, _ = record_run(result, adb_command(result.serial, "root"), check=False)
-    record_run(result, adb_command(result.serial, "wait-for-device"))
-    result.summary = {"stdout": stdout.strip()}
+    stdout = perform_root(result.serial, result)
+    result.summary = {"stdout": stdout}
 
 
 def action_system_unroot(args: argparse.Namespace, result: ActionResult) -> None:
@@ -745,37 +1078,102 @@ def action_system_unroot(args: argparse.Namespace, result: ActionResult) -> None
 
 
 def action_system_remount(args: argparse.Namespace, result: ActionResult) -> None:
-    strategies: list[tuple[str, list[str] | str]] = [
-        ("direct-remount", adb_command(result.serial, "remount")),
-        ("root-then-remount", adb_command(result.serial, "root")),
-        ("su-mount", "su -c 'mount -o rw,remount /system || mount -o rw,remount /'"),
-    ]
-    chosen = None
-    failures = []
-    for name, command in strategies:
-        try:
-            if isinstance(command, list):
-                record_run(result, command, check=False)
-                if name == "root-then-remount":
-                    record_run(result, adb_command(result.serial, "wait-for-device"))
-                    stdout, _ = record_run(result, adb_command(result.serial, "remount"), check=False)
-                else:
-                    stdout = result.commands[-1].stdout
-            else:
-                stdout = shell_out(result.serial, command, result, check=False)
-            if "remount succeeded" in stdout.lower() or "rw" in stdout.lower() or "already running as root" in stdout.lower():
-                chosen = name
-                break
-            if name == "su-mount":
-                chosen = name
-                break
-            failures.append({"strategy": name, "stdout": stdout.strip()})
-        except Exception as exc:  # pragma: no cover - device-dependent failures
-            failures.append({"strategy": name, "error": str(exc)})
-    result.summary = {"strategy": chosen, "failures": failures}
-    result.metrics = {"strategy_count": len(strategies), "chosen": chosen or ""}
-    if not chosen:
-        raise AdbOpsError("All remount strategies failed.")
+    remount = run_remount_strategy(result.serial, result)
+    result.summary = {"strategy": remount["strategy"], "failures": remount["failures"]}
+    result.metrics = {"strategy_count": remount["strategy_count"], "chosen": remount["strategy"]}
+
+
+def action_system_build_prop_get(args: argparse.Namespace, result: ActionResult) -> None:
+    build_prop_path = resolve_build_prop_path(result.serial, result, args.path)
+    local_copy = result.artifact_dir / "build.prop"
+    record_run(result, adb_command(result.serial, "pull", build_prop_path, str(local_copy)))
+    result.artifacts["build.prop"] = str(local_copy)
+    content = local_copy.read_text(encoding="utf-8", errors="replace")
+    props = parse_build_prop(content)
+    value = props.get(args.key, "")
+    result.summary = {"path": build_prop_path, "key": args.key, "value": value}
+    result.metrics = {"present": int(args.key in props), "line_count": len(content.splitlines())}
+
+
+def action_system_build_prop_set(args: argparse.Namespace, result: ActionResult) -> None:
+    build_prop_path = resolve_build_prop_path(result.serial, result, args.path)
+    root_stdout = perform_root(result.serial, result)
+    remount = run_remount_strategy(result.serial, result)
+    local_copy = result.artifact_dir / "build.prop.before"
+    record_run(result, adb_command(result.serial, "pull", build_prop_path, str(local_copy)))
+    original = local_copy.read_text(encoding="utf-8", errors="replace")
+    lines = original.splitlines()
+    updates: dict[str, str] = {}
+    for assignment in args.assignment:
+        if "=" not in assignment:
+            raise AdbOpsError(f"Invalid build.prop assignment: {assignment}")
+        key, value = assignment.split("=", 1)
+        updates[key.strip()] = value.strip()
+
+    pending = dict(updates)
+    updated_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, _ = stripped.split("=", 1)
+            normalized = key.strip()
+            if normalized in pending:
+                updated_lines.append(f"{normalized}={pending.pop(normalized)}")
+                continue
+        updated_lines.append(line)
+    for key, value in pending.items():
+        updated_lines.append(f"{key}={value}")
+    edited_content = "\n".join(updated_lines) + "\n"
+    edited_local = result.artifact_dir / "build.prop.after"
+    edited_local.write_text(edited_content, encoding="utf-8")
+    result.artifacts["build.prop.before"] = str(local_copy)
+    result.artifacts["build.prop.after"] = str(edited_local)
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = f"{build_prop_path}.adb-android-ops.{timestamp}.bak"
+    temp_remote = f"/data/local/tmp/adb-android-ops-build.prop-{timestamp}"
+    shell_out_su(
+        result.serial,
+        f"cp {shlex_quote(build_prop_path)} {shlex_quote(backup_path)}",
+        result,
+    )
+    record_run(result, adb_command(result.serial, "push", str(edited_local), temp_remote))
+    shell_out_su(
+        result.serial,
+        " && ".join(
+            [
+                f"cp {shlex_quote(temp_remote)} {shlex_quote(build_prop_path)}",
+                f"chmod 0644 {shlex_quote(build_prop_path)}",
+                f"chown 0:0 {shlex_quote(build_prop_path)}",
+                f"command -v restorecon >/dev/null 2>&1 && restorecon {shlex_quote(build_prop_path)} || true",
+                "sync",
+                f"rm -f {shlex_quote(temp_remote)}",
+            ]
+        ),
+        result,
+    )
+    verify_local = result.artifact_dir / "build.prop.verify"
+    record_run(result, adb_command(result.serial, "pull", build_prop_path, str(verify_local)))
+    result.artifacts["build.prop.verify"] = str(verify_local)
+    verified_props = parse_build_prop(verify_local.read_text(encoding="utf-8", errors="replace"))
+    applied = {key: verified_props.get(key, "") for key in updates}
+    mismatches = {key: {"expected": updates[key], "actual": applied[key]} for key in updates if updates[key] != applied[key]}
+    if mismatches:
+        raise AdbOpsError(f"build.prop verification failed: {json.dumps(mismatches, ensure_ascii=False)}")
+    if args.reboot:
+        reboot_ns = argparse.Namespace(mode="system")
+        action_system_reboot(reboot_ns, result)
+    result.summary = {
+        "path": build_prop_path,
+        "backup_path": backup_path,
+        "root_stdout": root_stdout,
+        "remount_strategy": remount["strategy"],
+        "applied": applied,
+    }
+    result.metrics = {
+        "assignment_count": len(updates),
+        "verified_count": len(applied),
+    }
 
 
 def action_system_reboot(args: argparse.Namespace, result: ActionResult) -> None:
@@ -823,6 +1221,10 @@ def build_parser() -> argparse.ArgumentParser:
     wait = device_sub.add_parser("wait")
     wait.add_argument("--timeout", type=int, default=60)
     wait.set_defaults(handler=action_device_wait)
+    core_info = device_sub.add_parser("core-info")
+    core_info.set_defaults(handler=action_device_core_info)
+    storage = device_sub.add_parser("storage")
+    storage.set_defaults(handler=action_device_storage)
     props = subparsers.add_parser("props")
     props_sub = props.add_subparsers(dest="action", required=True)
     props_get = props_sub.add_parser("get")
@@ -880,6 +1282,10 @@ def build_parser() -> argparse.ArgumentParser:
     app_start_time.add_argument("--activity")
     app_start_time.add_argument("--warm", action="store_true")
     app_start_time.set_defaults(handler=action_app_start_time)
+    app_video_codec = app_sub.add_parser("video-codec")
+    app_video_codec.add_argument("--package")
+    app_video_codec.add_argument("--limit", type=int, default=10)
+    app_video_codec.set_defaults(handler=action_app_video_codec)
 
     ui = subparsers.add_parser("ui")
     ui_sub = ui.add_subparsers(dest="action", required=True)
@@ -939,6 +1345,15 @@ def build_parser() -> argparse.ArgumentParser:
     system_sub.add_parser("root").set_defaults(handler=action_system_root)
     system_sub.add_parser("unroot").set_defaults(handler=action_system_unroot)
     system_sub.add_parser("remount").set_defaults(handler=action_system_remount)
+    build_prop_get = system_sub.add_parser("build-prop-get")
+    build_prop_get.add_argument("key")
+    build_prop_get.add_argument("--path")
+    build_prop_get.set_defaults(handler=action_system_build_prop_get)
+    build_prop_set = system_sub.add_parser("build-prop-set")
+    build_prop_set.add_argument("assignment", nargs="+")
+    build_prop_set.add_argument("--path")
+    build_prop_set.add_argument("--reboot", action="store_true")
+    build_prop_set.set_defaults(handler=action_system_build_prop_set)
     reboot = system_sub.add_parser("reboot")
     reboot.add_argument("--mode", choices=["system", "bootloader", "recovery"], default="system")
     reboot.set_defaults(handler=action_system_reboot)
@@ -975,6 +1390,8 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     serial = resolve_serial(args.serial, requires_serial(args.group, args.action))
     result = ActionResult(group=args.group, action=args.action, serial=serial, out_dir=out_dir)
+    result.notes.append(f"adb_source={ADB_SOURCE}")
+    result.notes.append(f"adb_binary={ADB}")
     try:
         handler = args.handler
         handler(args, result)

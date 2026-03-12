@@ -11,11 +11,14 @@ Current version: `0.0.1`
 - Package management with install, uninstall, clear, grant, and revoke flows
 - App state, process checks, and cold-start timing
 - Memory, CPU, graphics, and network diagnostics
+- Partition layout and filesystem usage snapshots
+- Batch-formatted device core information
 - Screenshot capture, layout dump, and UI comparison against image or HTML inputs
 - Logcat capture, filtering, and lightweight analysis
+- Recent video codec usage analysis from media metrics and player state
 - Simulated touch, swipe, text, and key events
 - Wi-Fi and Bluetooth control
-- Root, remount, reboot, and boot-status checks
+- Root, remount, reboot, boot-status, and build.prop editing
 
 ## Repository Layout
 
@@ -25,13 +28,15 @@ Current version: `0.0.1`
 - `references/command-matrix.md`: command inventory and argument map
 - `references/validation-playbook.md`: end-to-end validation steps
 - `assets/validation/reference.html`: HTML fixture for UI diff validation
+- `assets/platform-tools/`: bundled official platform-tools for macOS, Linux, and Windows fallback use
 
 ## Requirements
 
-- `adb` on `PATH`
 - Python 3
 - `Pillow` for image-based UI comparison
 - `playwright` plus a Chromium install for HTML or URL rendering in `ui compare`
+
+The CLI prefers `adb` from `PATH`. If it is not available, it automatically falls back to the bundled platform-tools copy for the current OS.
 
 Recommended local setup for HTML diff support:
 
@@ -53,8 +58,13 @@ Examples:
 ```bash
 python3 scripts/adb_ops.py --serial auto device info
 python3 scripts/adb_ops.py --serial auto props get ro.build.version.release
+python3 scripts/adb_ops.py --serial auto device core-info
+python3 scripts/adb_ops.py --serial auto device storage
 python3 scripts/adb_ops.py --serial auto app start-time com.fithub.launcher
+python3 scripts/adb_ops.py --serial auto app video-codec --limit 5
 python3 scripts/adb_ops.py --serial auto ui compare --design assets/validation/reference.html
+python3 scripts/adb_ops.py --serial auto system build-prop-get ro.system.build.fingerprint
+python3 scripts/adb_ops.py --serial auto system build-prop-set persist.adb_android_ops.validation=1
 python3 scripts/adb_ops.py --serial auto system remount
 ```
 

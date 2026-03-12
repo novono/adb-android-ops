@@ -13,6 +13,8 @@ python3 /Users/William/.codex/skills/.system/skill-creator/scripts/quick_validat
 python3 scripts/adb_ops.py --help
 python3 scripts/adb_ops.py device list --help
 python3 scripts/adb_ops.py ui compare --help
+python3 scripts/adb_ops.py device core-info --help
+python3 scripts/adb_ops.py system build-prop-set --help
 ```
 
 ## Device Validation Sequence
@@ -29,6 +31,7 @@ python3 scripts/adb_ops.py --serial auto device info
 python3 scripts/adb_ops.py --serial auto props get ro.build.version.release
 python3 scripts/adb_ops.py --serial auto props get ro.build.version.sdk
 python3 scripts/adb_ops.py --serial auto props get ro.debuggable
+python3 scripts/adb_ops.py --serial auto device core-info
 ```
 
 3. Package inspection
@@ -83,6 +86,7 @@ python3 scripts/adb_ops.py --serial auto radio bluetooth on
 10. System operations
 ```bash
 python3 scripts/adb_ops.py --serial auto system remount
+python3 scripts/adb_ops.py --serial auto system build-prop-get ro.system.build.fingerprint
 python3 scripts/adb_ops.py --serial auto system reboot --mode system
 python3 scripts/adb_ops.py --serial auto system boot-status
 ```
@@ -100,3 +104,5 @@ python3 scripts/adb_ops.py --serial auto app start-time com.fithub.launcher
   - `artifacts/<command-name>/result.json`
 - `ui capture` also writes screenshot, layout XML, and window summary.
 - `ui compare` also writes `design.png`, `device.png`, `diff.png`, and `summary.json`.
+- `device storage` writes raw partition, `df`, mount, and by-name outputs.
+- `app video-codec` writes raw `media.metrics`, `media.player`, and `media_session` dumps.
