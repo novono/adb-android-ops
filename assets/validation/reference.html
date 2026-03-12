@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ADB Android Ops Validation Reference</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        --ink: #152033;
+        --accent: #0c8f7f;
+        --warm: #ffb55f;
+        --bg: linear-gradient(135deg, #f5fbff 0%, #e2f4ef 48%, #fff6ea 100%);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--ink);
+      }
+
+      .frame {
+        width: 1280px;
+        height: 720px;
+        margin: 0 auto;
+        padding: 48px;
+        display: grid;
+        grid-template-columns: 1.3fr 0.9fr;
+        gap: 28px;
+      }
+
+      .panel {
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.82);
+        border: 1px solid rgba(21, 32, 51, 0.08);
+        box-shadow: 0 18px 60px rgba(21, 32, 51, 0.12);
+      }
+
+      .hero {
+        padding: 40px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        width: fit-content;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(12, 143, 127, 0.12);
+        color: var(--accent);
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 18px 0 12px;
+        font-size: 72px;
+        line-height: 1;
+      }
+
+      p {
+        margin: 0;
+        font-size: 28px;
+        line-height: 1.4;
+        max-width: 680px;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+
+      .stat {
+        padding: 18px;
+        border-radius: 20px;
+        background: #fff;
+      }
+
+      .stat strong {
+        display: block;
+        font-size: 40px;
+      }
+
+      .stat span {
+        color: rgba(21, 32, 51, 0.68);
+        font-size: 18px;
+      }
+
+      .rail {
+        padding: 28px;
+        display: grid;
+        gap: 18px;
+      }
+
+      .card {
+        border-radius: 22px;
+        padding: 22px;
+        background: #fff;
+      }
+
+      .card h2 {
+        margin: 0 0 12px;
+        font-size: 30px;
+      }
+
+      .meter {
+        height: 16px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(21, 32, 51, 0.08);
+      }
+
+      .meter > div {
+        height: 100%;
+        border-radius: 999px;
+      }
+
+      .good {
+        width: 84%;
+        background: linear-gradient(90deg, var(--accent), #57cbb9);
+      }
+
+      .warn {
+        width: 46%;
+        background: linear-gradient(90deg, var(--warm), #ff8f5f);
+      }
+
+      ul {
+        margin: 14px 0 0;
+        padding-left: 20px;
+        font-size: 20px;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="frame">
+      <section class="panel hero">
+        <div>
+          <span class="eyebrow">Validation Target</span>
+          <h1>ADB Android Ops</h1>
+          <p>
+            A stable reference page for screenshot capture, HTML rendering, and image diff
+            validation.
+          </p>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <strong>14</strong>
+            <span>Android Version</span>
+          </div>
+          <div class="stat">
+            <strong>35</strong>
+            <span>SDK Level</span>
+          </div>
+          <div class="stat">
+            <strong>2592 ms</strong>
+            <span>Observed Cold Start</span>
+          </div>
+        </div>
+      </section>
+      <aside class="panel rail">
+        <article class="card">
+          <h2>Launch Score</h2>
+          <div class="meter"><div class="good"></div></div>
+          <ul>
+            <li>Device discovery</li>
+            <li>Layout dump</li>
+            <li>Structured artifacts</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>Risky Ops</h2>
+          <div class="meter"><div class="warn"></div></div>
+          <ul>
+            <li>Wi-Fi and Bluetooth toggles</li>
+            <li>Remount strategy chain</li>
+            <li>System reboot only in automated validation</li>
+          </ul>
+        </article>
+      </aside>
+    </main>
+  </body>
+</html>

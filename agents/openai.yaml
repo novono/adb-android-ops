@@ -1,0 +1,4 @@
+interface:
+  display_name: "ADB Android Ops"
+  short_description: "ADB toolbox for Android device operations"
+  default_prompt: "Use $adb-android-ops to inspect, control, profile, or compare an Android device over adb."
